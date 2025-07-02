@@ -1,16 +1,17 @@
 # janus_flutter_example
 
-Demonstrates how to use the janus_flutter plugin.
+This example demonstrates how to connect to a Janus WebRTC server and run the
+`janus.plugin.echotest` plugin. Two video windows will appear showing the local
+and remote streams.
 
 ## Getting Started
 
-This project is a starting point for a Flutter application.
+### Running the example
 
-A few resources to get you started if this is your first Flutter project:
+1. Install Flutter on your machine.
+2. From the repository root run `flutter pub get` inside the `example` folder.
+3. Start the example with `flutter run`.
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+The example uses the public Janus demo server at
+`wss://janus.conf.meetecho.com/ws`. You can change the server URL in
+`example/lib/main.dart` if you are running your own Janus instance.
