@@ -72,6 +72,8 @@ typedef OnDetachedCallback = void Function();
 typedef LocalCandidateCallback = void Function(RTCIceCandidate candidate);
 typedef ConnectionStateCallback = void Function(RTCPeerConnectionState state);
 typedef RemoteStreamCallback = void Function(MediaStream stream);
+typedef DataOpenCallback = void Function();
+typedef DataCallback = void Function(RTCDataChannelMessage message);
 
 // --- Main Janus Class ---
 class Janus {
@@ -582,9 +584,12 @@ class JanusPluginHandle {
   final SlowLinkCallback? slowLink;
   final OnCleanupCallback? oncleanup;
   final OnDetachedCallback? ondetached;
+  final DataOpenCallback? ondataopen;
+  final DataCallback? ondata;
 
   bool _detached = false;
   RTCPeerConnection? _peerConnection;
+  RTCDataChannel? _dataChannel;
   LocalCandidateCallback? onLocalCandidate;
   ConnectionStateCallback? onConnectionState;
   RemoteStreamCallback? onRemoteStream;
@@ -601,6 +606,8 @@ class JanusPluginHandle {
     this.slowLink,
     this.oncleanup,
     this.ondetached,
+    this.ondataopen,
+    this.ondata,
     this.onLocalCandidate,
     this.onConnectionState,
     this.onRemoteStream,
@@ -689,6 +696,8 @@ class JanusPluginHandle {
   }
 
   Future<void> _cleanup() async {
+    await _dataChannel?.close();
+    _dataChannel = null;
     _detached = true;
     session._pluginHandles.remove(id);
     oncleanup?.call();
@@ -707,6 +716,18 @@ class JanusPluginHandle {
   }) async {
     _peerConnection =
         await createPeerConnection(configuration, offerSdpConstraints);
+
+    final dcInit = RTCDataChannelInit();
+    dcInit.ordered = true;
+    _dataChannel = await _peerConnection!.createDataChannel('oai-events', dcInit);
+    _dataChannel!.onDataChannelState = (state) {
+      if (state == RTCDataChannelState.RTCDataChannelOpen) {
+        ondataopen?.call();
+      }
+    };
+    _dataChannel!.onMessage = (message) {
+      ondata?.call(message);
+    };
 
     for (final stream in mediaStreams) {
       for (final track in stream.getTracks()) {
@@ -767,6 +788,8 @@ class JanusPluginHandle {
   }
 
   Future<void> closePeerConnection() async {
+    await _dataChannel?.close();
+    _dataChannel = null;
     await _peerConnection?.close();
     _peerConnection = null;
   }
