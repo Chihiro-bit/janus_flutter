@@ -1,4 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+
+import 'src/websocket_client.dart';
 
 // Note: This is an outline of the janus.js library's API translated to Dart.
 // It focuses on method signatures and callback mechanisms as requested.
@@ -82,8 +86,9 @@ class Janus {
 
   /// Generates a random string for transaction IDs.
   static String randomString(int len) {
-    // Implementation to generate a random string.
-    return DateTime.now().millisecondsSinceEpoch.toString(); // Placeholder
+    final rnd = Random.secure();
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    return List.generate(len, (_) => chars[rnd.nextInt(chars.length)]).join();
   }
 
   /// Stops all tracks on a given MediaStream.
@@ -104,6 +109,8 @@ class JanusSession {
   bool _connected = false;
   String? _server;
   final Map<int, JanusPluginHandle> _pluginHandles = {};
+  final Map<String, Completer<Map<String, dynamic>>> _transactions = {};
+  JanusWebSocketClient? _ws;
 
   /// Creates a new session with the Janus Gateway.
   JanusSession({
@@ -120,15 +127,75 @@ class JanusSession {
       onError?.call("Janus.init() must be called first");
       return;
     }
-    // The constructor would start the process of connecting to the server.
-    // This involves either a WebSocket connection or HTTP long-polling.
-    _createSession(server);
+    // Start the process of connecting to the server using WebSockets.
+    unawaited(_createSession(server));
   }
 
-  void _createSession(dynamic server) {
-    // Internal logic to create a session via HTTP or WebSocket.
-    // On success, it would set _connected, _sessionId, and call onSuccess.
-    // On failure, it would call onError.
+  Future<void> _createSession(dynamic server) async {
+    _server = server is List ? server.first : server.toString();
+    _ws = JanusWebSocketClient(
+      url: _server!,
+      onData: _onWsMessage,
+      onError: (err) => onError?.call(err.toString()),
+      onDone: () {
+        _connected = false;
+        onDestroyed?.call();
+      },
+    );
+
+    try {
+      await _ws!.connect();
+      final response = await _send({'janus': 'create'});
+      if (response['janus'] == 'success') {
+        _sessionId = response['data']['id'];
+        _connected = true;
+        Janus.sessions[_sessionId!] = this;
+        onSuccess?.call();
+      } else {
+        onError?.call(response);
+      }
+    } catch (e) {
+      onError?.call(e);
+    }
+  }
+
+  Future<Map<String, dynamic>> _send(Map<String, dynamic> request) {
+    final transaction = Janus.randomString(12);
+    request['transaction'] = transaction;
+    if (_sessionId != null) {
+      request['session_id'] = _sessionId;
+    }
+    final completer = Completer<Map<String, dynamic>>();
+    _transactions[transaction] = completer;
+    _ws?.send(jsonEncode(request));
+    return completer.future;
+  }
+
+  void _onWsMessage(dynamic data) {
+    final msg = data is String ? jsonDecode(data) : data as Map<String, dynamic>;
+    final tx = msg['transaction'];
+    if (tx != null && _transactions.containsKey(tx)) {
+      _transactions.remove(tx)!.complete(msg);
+      return;
+    }
+
+    final sender = msg['sender'];
+    if (sender != null && _pluginHandles.containsKey(sender)) {
+      final handle = _pluginHandles[sender]!;
+      if (msg['janus'] == 'event') {
+        final plugindata = msg['plugindata']?['data'];
+        final jsepMap = msg['jsep'];
+        Jsep? jsep;
+        if (jsepMap != null) {
+          jsep = Jsep(
+            type: jsepMap['type'],
+            sdp: jsepMap['sdp'],
+            e2ee: jsepMap['e2ee'],
+          );
+        }
+        handle.onmessage?.call(plugindata, jsep);
+      }
+    }
   }
 
   // --- Public API ---
@@ -138,13 +205,45 @@ class JanusSession {
   int? getSessionId() => _sessionId;
 
   /// Re-establishes a connection to the gateway.
-  Future<void> reconnect({SessionSuccessCallback? success, ErrorCallback? error}) async {}
+  Future<void> reconnect({SessionSuccessCallback? success, ErrorCallback? error}) async {
+    if (_server == null) {
+      error?.call('No server configured');
+      return;
+    }
+    await _createSession(_server!);
+    success?.call();
+  }
 
   /// Gets information about the Janus Gateway instance.
-  Future<void> getInfo({SuccessCallback<Map<String, dynamic>>? success, ErrorCallback? error}) async {}
+  Future<void> getInfo({SuccessCallback<Map<String, dynamic>>? success, ErrorCallback? error}) async {
+    try {
+      final res = await _send({'janus': 'info'});
+      success?.call(res);
+    } catch (e) {
+      error?.call(e);
+    }
+  }
 
   /// Destroys the session, cleaning up all associated handles and resources.
-  Future<void> destroy({SessionSuccessCallback? success, ErrorCallback? error}) async {}
+  Future<void> destroy({SessionSuccessCallback? success, ErrorCallback? error}) async {
+    if (_sessionId == null) {
+      success?.call();
+      return;
+    }
+    try {
+      final res = await _send({'janus': 'destroy'});
+      if (res['janus'] == 'success') {
+        _connected = false;
+        _sessionId = null;
+        await _ws?.close();
+        success?.call();
+      } else {
+        error?.call(res);
+      }
+    } catch (e) {
+      error?.call(e);
+    }
+  }
 
   /// Attaches to a specific plugin on the Janus Gateway.
   Future<void> attach({
@@ -165,8 +264,28 @@ class JanusSession {
     WebRTCStateCallback? webrtcState,
     SlowLinkCallback? slowLink,
   }) async {
-    // Implementation would send an 'attach' message to Janus.
-    // On success, it creates a JanusPluginHandle and passes it to the success callback.
+    try {
+      final request = {'janus': 'attach', 'plugin': plugin};
+      if (opaqueId != null) request['opaque_id'] = opaqueId;
+      final res = await _send(request);
+      if (res['janus'] == 'success') {
+        final handleId = res['data']['id'];
+        final handle = JanusPluginHandle(
+          session: this,
+          plugin: plugin,
+          id: handleId,
+          onmessage: onmessage,
+          onlocaltrack: onlocaltrack,
+          onremotetrack: onremotetrack,
+        );
+        _pluginHandles[handleId] = handle;
+        success?.call(handle);
+      } else {
+        error?.call(res);
+      }
+    } catch (e) {
+      error?.call(e);
+    }
   }
 }
 
@@ -201,7 +320,27 @@ class JanusPluginHandle {
   String getPlugin() => plugin;
 
   /// Sends a message (with or without a JSEP) to the plugin.
-  Future<void> send({required Map<String, dynamic> message, Jsep? jsep, SuccessCallback<dynamic>? success, ErrorCallback? error}) async {}
+  Future<void> send({required Map<String, dynamic> message, Jsep? jsep, SuccessCallback<dynamic>? success, ErrorCallback? error}) async {
+    final request = {
+      'janus': 'message',
+      'body': message,
+      'handle_id': id,
+    };
+    if (jsep != null) request['jsep'] = jsep.toMap();
+
+    try {
+      final res = await session._send(request);
+      if (res['janus'] == 'ack') {
+        success?.call(res);
+      } else if (res['janus'] == 'success') {
+        success?.call(res['plugindata']['data']);
+      } else {
+        error?.call(res);
+      }
+    } catch (e) {
+      error?.call(e);
+    }
+  }
 
   /// Sends data over the Data Channel.
   Future<void> data({required String text, String? label, SessionSuccessCallback? success, ErrorCallback? error}) async {}
@@ -245,7 +384,20 @@ class JanusPluginHandle {
   Future<void> hangup({bool sendRequest = true}) async {}
 
   /// Detaches from the plugin, releasing the handle on the gateway.
-  Future<void> detach({SessionSuccessCallback? success, ErrorCallback? error}) async {}
+  Future<void> detach({SessionSuccessCallback? success, ErrorCallback? error}) async {
+    try {
+      final res = await session._send({'janus': 'detach', 'handle_id': id});
+      if (res['janus'] == 'success') {
+        detached = true;
+        session._pluginHandles.remove(id);
+        success?.call();
+      } else {
+        error?.call(res);
+      }
+    } catch (e) {
+      error?.call(e);
+    }
+  }
 
   // --- Media utility methods ---
 
