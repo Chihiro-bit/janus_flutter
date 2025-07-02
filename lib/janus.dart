@@ -694,7 +694,7 @@ class JanusPluginHandle {
     oncleanup?.call();
   }
 
-  Future<void> createPeerConnection({
+  Future<void> initPeerConnection({
     Map<String, dynamic> configuration = const {},
     Map<String, dynamic> offerSdpConstraints = const {
       'mandatory': {
@@ -705,8 +705,7 @@ class JanusPluginHandle {
     },
     List<MediaStream> mediaStreams = const [],
   }) async {
-    _peerConnection =
-        await createPeerConnection(configuration, offerSdpConstraints);
+    _peerConnection = await createPeerConnection(configuration, offerSdpConstraints);
 
     for (final stream in mediaStreams) {
       for (final track in stream.getTracks()) {
@@ -741,7 +740,7 @@ class JanusPluginHandle {
     }
     final offer = await _peerConnection!.createOffer(constraints);
     await _peerConnection!.setLocalDescription(offer);
-    return Jsep(type: offer.type, sdp: offer.sdp);
+    return Jsep(type: offer.type??"", sdp: offer.sdp??"");
   }
 
   Future<Jsep> createAnswer(
@@ -751,7 +750,7 @@ class JanusPluginHandle {
     }
     final answer = await _peerConnection!.createAnswer(constraints);
     await _peerConnection!.setLocalDescription(answer);
-    return Jsep(type: answer.type, sdp: answer.sdp);
+    return Jsep(type: answer.type??"", sdp: answer.sdp??"");
   }
 
   Future<void> handleRemoteJsep(Jsep jsep) async {
