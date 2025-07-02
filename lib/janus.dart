@@ -1,262 +1,671 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
 
-// Note: This is an outline of the janus.js library's API translated to Dart.
-// It focuses on method signatures and callback mechanisms as requested.
-// A full implementation would require an HTTP client, WebSocket client,
-// and a WebRTC library (e.g., flutter_webrtc).
+import 'log/janus_log.dart';
 
-// --- Data Classes & Placeholders ---
 
-/// Represents a JSEP (JavaScript Session Establishment Protocol) object.
+
+// --- Data Classes ---
 class Jsep {
-  String type;
-  String sdp;
-  bool? e2ee;
+  final String type;
+  final String sdp;
+  final bool? e2ee;
 
   Jsep({required this.type, required this.sdp, this.e2ee});
 
-  Map<String, dynamic> toMap() => {'type': type, 'sdp': sdp, 'e2ee': e2ee};
+  factory Jsep.fromMap(Map<String, dynamic> map) {
+    return Jsep(
+      type: map['type'] as String,
+      sdp: map['sdp'] as String,
+      e2ee: map['e2ee'] as bool?,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'type': type,
+      'sdp': sdp,
+      if (e2ee != null) 'e2ee': e2ee,
+    };
+  }
 }
 
-/// Placeholder for a WebRTC MediaStreamTrack.
-/// In a real app, this would come from a library like flutter_webrtc.
-class MediaStreamTrack {}
+class JanusError {
+  final int code;
+  final String reason;
 
-/// Placeholder for a WebRTC MediaStream.
-class MediaStream {}
+  JanusError({required this.code, required this.reason});
+
+  factory JanusError.fromMap(Map<String, dynamic> map) {
+    return JanusError(
+      code: map['code'] as int,
+      reason: map['reason'] as String,
+    );
+  }
+
+  @override
+  String toString() => 'JanusError(code: $code, reason: $reason)';
+}
 
 // --- Callback Typedefs ---
-
-// General
 typedef SuccessCallback<T> = void Function(T result);
 typedef ErrorCallback = void Function(dynamic error);
+typedef VoidCallback = void Function();
 
-// Janus.init
-typedef InitSuccessCallback = void Function();
-
-// JanusSession
+// Session callbacks
 typedef SessionSuccessCallback = void Function();
 typedef SessionDestroyedCallback = void Function();
 
-// JanusPluginHandle
+// Plugin callbacks
 typedef PluginSuccessCallback = void Function(JanusPluginHandle handle);
 typedef OnMessageCallback = void Function(dynamic msg, Jsep? jsep);
-typedef OnTrackCallback = void Function(MediaStreamTrack track, bool added);
-typedef OnRemoteTrackCallback = void Function(MediaStreamTrack track, String mid, bool added);
-typedef OnDataCallback = void Function(dynamic data, String label);
-typedef OnDataOpenCallback = void Function(String label);
-typedef OnCleanupCallback = void Function();
-typedef OnDetachedCallback = void Function();
 typedef ConsentDialogCallback = void Function(bool on);
 typedef IceStateCallback = void Function(String state);
 typedef MediaStateCallback = void Function(String type, bool receiving, String? mid);
 typedef WebRTCStateCallback = void Function(bool on, String? reason);
 typedef SlowLinkCallback = void Function(bool uplink, int lost, String? mid);
+typedef OnCleanupCallback = void Function();
+typedef OnDetachedCallback = void Function();
 
-// --- Janus Static Class ---
-
-/// Contains static methods for initializing and interacting with the Janus library.
+// --- Main Janus Class ---
 class Janus {
   static bool _initDone = false;
   static final Map<int, JanusSession> sessions = {};
 
-  /// Initializes the Janus library. This must be called before creating any session.
+  /// Initialize the Janus library
   static Future<void> init({
     List<String> debug = const [],
-    InitSuccessCallback? callback,
+    VoidCallback? callback,
   }) async {
-    // Implementation would set up logging and other global configurations.
+    if (_initDone) {
+      callback?.call();
+      return;
+    }
+
+    JanusLogger.init(debug: debug);
+    JanusLogger.log('Initializing Janus library');
+
     _initDone = true;
-    print("Janus library initialized.");
     callback?.call();
   }
 
-  /// Checks if the library has been initialized.
-  static bool isInitialized() => _initDone;
+  /// Check if library is initialized
+  static bool get initDone => _initDone;
 
-  /// Checks if WebRTC is supported in the current environment.
-  static bool isWebrtcSupported() {
-    // Platform-specific implementation to check for WebRTC support.
-    return true; // Placeholder
-  }
+  /// Check if WebRTC is supported (placeholder - would need platform-specific implementation)
+  static bool isWebrtcSupported() => true;
 
-  /// Generates a random string for transaction IDs.
-  static String randomString(int len) {
-    // Implementation to generate a random string.
-    return DateTime.now().millisecondsSinceEpoch.toString(); // Placeholder
-  }
-
-  /// Stops all tracks on a given MediaStream.
-  static void stopAllTracks(MediaStream stream) {
-    // Implementation would iterate over stream.getTracks() and call stop() on each.
+  /// Generate random string for transactions
+  static String randomString(int length) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    final random = Random();
+    return String.fromCharCodes(
+      Iterable.generate(length, (_) => chars.codeUnitAt(random.nextInt(chars.length))),
+    );
   }
 }
 
 // --- Janus Session ---
-
-/// Represents a connection to a Janus Gateway instance.
 class JanusSession {
+  final String server;
   final SessionSuccessCallback? onSuccess;
   final ErrorCallback? onError;
   final SessionDestroyedCallback? onDestroyed;
+  final String? token;
+  final String? apisecret;
+  final bool destroyOnUnload;
 
   int? _sessionId;
   bool _connected = false;
-  String? _server;
+  WebSocket? _webSocket;
+  final Map<String, Completer<Map<String, dynamic>>> _transactions = {};
   final Map<int, JanusPluginHandle> _pluginHandles = {};
+  Timer? _keepAliveTimer;
 
-  /// Creates a new session with the Janus Gateway.
   JanusSession({
-    required dynamic server, // String or List<String>
+    required this.server,
     this.onSuccess,
     this.onError,
     this.onDestroyed,
-    List<Map<String, String>>? iceServers,
-    String? token,
-    String? apisecret,
-    bool destroyOnUnload = true,
+    this.token,
+    this.apisecret,
+    this.destroyOnUnload = true,
   }) {
-    if (!Janus.isInitialized()) {
-      onError?.call("Janus.init() must be called first");
+    if (!Janus.initDone) {
+      onError?.call('Library not initialized');
       return;
     }
-    // The constructor would start the process of connecting to the server.
-    // This involves either a WebSocket connection or HTTP long-polling.
-    _createSession(server);
-  }
-
-  void _createSession(dynamic server) {
-    // Internal logic to create a session via HTTP or WebSocket.
-    // On success, it would set _connected, _sessionId, and call onSuccess.
-    // On failure, it would call onError.
+    _createSession();
   }
 
   // --- Public API ---
-
-  String? getServer() => _server;
+  String getServer() => server;
   bool isConnected() => _connected;
   int? getSessionId() => _sessionId;
 
-  /// Re-establishes a connection to the gateway.
-  Future<void> reconnect({SessionSuccessCallback? success, ErrorCallback? error}) async {}
+  /// Reconnect to the server
+  Future<void> reconnect({
+    SessionSuccessCallback? success,
+    ErrorCallback? error,
+  }) async {
+    try {
+      await _createSession();
+      success?.call();
+    } catch (e) {
+      error?.call(e);
+    }
+  }
 
-  /// Gets information about the Janus Gateway instance.
-  Future<void> getInfo({SuccessCallback<Map<String, dynamic>>? success, ErrorCallback? error}) async {}
+  /// Get server information
+  Future<void> getInfo({
+    SuccessCallback<Map<String, dynamic>>? success,
+    ErrorCallback? error,
+  }) async {
+    if (!_connected) {
+      error?.call('Not connected to server');
+      return;
+    }
 
-  /// Destroys the session, cleaning up all associated handles and resources.
-  Future<void> destroy({SessionSuccessCallback? success, ErrorCallback? error}) async {}
+    try {
+      final transaction = Janus.randomString(12);
+      final request = {
+        'janus': 'info',
+        'transaction': transaction,
+      };
 
-  /// Attaches to a specific plugin on the Janus Gateway.
+      if (token != null) request['token'] = token!;
+      if (apisecret != null) request['apisecret'] = apisecret!;
+
+      final response = await _sendMessage(request, transaction);
+      success?.call(response);
+    } catch (e) {
+      error?.call(e);
+    }
+  }
+
+  /// Destroy the session
+  Future<void> destroy({
+    SessionSuccessCallback? success,
+    ErrorCallback? error,
+    bool unload = false,
+  }) async {
+    JanusLogger.log('Destroying session $_sessionId (unload=$unload)');
+
+    if (_sessionId == null) {
+      JanusLogger.warn('No session to destroy');
+      success?.call();
+      onDestroyed?.call();
+      return;
+    }
+
+    // Clean up plugin handles
+    for (final handle in _pluginHandles.values) {
+      await handle._cleanup();
+    }
+    _pluginHandles.clear();
+
+    if (!_connected) {
+      JanusLogger.warn('Not connected to server');
+      _sessionId = null;
+      success?.call();
+      onDestroyed?.call();
+      return;
+    }
+
+    try {
+      final transaction = Janus.randomString(12);
+      final request = {
+        'janus': 'destroy',
+        'transaction': transaction,
+      };
+
+      if (token != null) request['token'] = token!;
+      if (apisecret != null) request['apisecret'] = apisecret!;
+
+      if (unload) {
+        // Just close the connection for unload
+        await _webSocket?.close();
+      } else {
+        await _sendMessage(request, transaction);
+      }
+
+      _cleanup();
+      success?.call();
+      onDestroyed?.call();
+    } catch (e) {
+      _cleanup();
+      error?.call(e);
+      onDestroyed?.call();
+    }
+  }
+
+  /// Attach to a plugin
   Future<void> attach({
     required String plugin,
     String? opaqueId,
     PluginSuccessCallback? success,
     ErrorCallback? error,
     OnMessageCallback? onmessage,
-    OnTrackCallback? onlocaltrack,
-    OnRemoteTrackCallback? onremotetrack,
-    OnDataCallback? ondata,
-    OnDataOpenCallback? ondataopen,
-    OnCleanupCallback? oncleanup,
-    OnDetachedCallback? ondetached,
     ConsentDialogCallback? consentDialog,
     IceStateCallback? iceState,
     MediaStateCallback? mediaState,
     WebRTCStateCallback? webrtcState,
     SlowLinkCallback? slowLink,
+    OnCleanupCallback? oncleanup,
+    OnDetachedCallback? ondetached,
   }) async {
-    // Implementation would send an 'attach' message to Janus.
-    // On success, it creates a JanusPluginHandle and passes it to the success callback.
+    if (!_connected) {
+      error?.call('Not connected to server');
+      return;
+    }
+
+    try {
+      final transaction = Janus.randomString(12);
+      final request = {
+        'janus': 'attach',
+        'plugin': plugin,
+        'transaction': transaction,
+      };
+
+      if (opaqueId != null) request['opaque_id'] = opaqueId;
+      if (token != null) request['token'] = token!;
+      if (apisecret != null) request['apisecret'] = apisecret!;
+
+      final response = await _sendMessage(request, transaction);
+
+      if (response['janus'] != 'success') {
+        final errorInfo = JanusError.fromMap(response['error']);
+        error?.call(errorInfo);
+        return;
+      }
+
+      final handleId = response['data']['id'] as int;
+      JanusLogger.log('Created handle: $handleId');
+
+      final pluginHandle = JanusPluginHandle(
+        session: this,
+        plugin: plugin,
+        id: handleId,
+        onmessage: onmessage,
+        consentDialog: consentDialog,
+        iceState: iceState,
+        mediaState: mediaState,
+        webrtcState: webrtcState,
+        slowLink: slowLink,
+        oncleanup: oncleanup,
+        ondetached: ondetached,
+      );
+
+      _pluginHandles[handleId] = pluginHandle;
+      success?.call(pluginHandle);
+    } catch (e) {
+      error?.call(e);
+    }
+  }
+
+  // --- Private Methods ---
+  Future<void> _createSession() async {
+    try {
+      JanusLogger.log('Creating session to $server');
+
+      if (server.startsWith('ws')) {
+        await _connectWebSocket();
+      } else {
+        throw UnsupportedError('HTTP transport not implemented in this example');
+      }
+    } catch (e) {
+      JanusLogger.error('Failed to create session: $e');
+      onError?.call(e);
+    }
+  }
+
+  Future<void> _connectWebSocket() async {
+    try {
+      _webSocket = await WebSocket.connect(server, protocols: ['janus-protocol']);
+
+      _webSocket!.listen(
+        _handleWebSocketMessage,
+        onError: (error) {
+          JanusLogger.error('WebSocket error: $error');
+          onError?.call(error);
+        },
+        onDone: () {
+          JanusLogger.log('WebSocket connection closed');
+          _connected = false;
+          onError?.call('Connection lost');
+        },
+      );
+
+      // Create session
+      final transaction = Janus.randomString(12);
+      final request = {
+        'janus': 'create',
+        'transaction': transaction,
+      };
+
+      if (token != null) request['token'] = token!;
+      if (apisecret != null) request['apisecret'] = apisecret!;
+
+      final response = await _sendMessage(request, transaction);
+
+      if (response['janus'] != 'success') {
+        final errorInfo = JanusError.fromMap(response['error']);
+        throw Exception(errorInfo.toString());
+      }
+
+      _sessionId = response['session_id'] ?? response['data']['id'];
+      _connected = true;
+
+      JanusLogger.log('Created session: $_sessionId');
+      Janus.sessions[_sessionId!] = this;
+
+      _startKeepAlive();
+      onSuccess?.call();
+    } catch (e) {
+      JanusLogger.error('WebSocket connection failed: $e');
+      throw e;
+    }
+  }
+
+  void _handleWebSocketMessage(dynamic data) {
+    try {
+      final json = jsonDecode(data as String) as Map<String, dynamic>;
+      JanusLogger.debug('Received: $json');
+
+      final transaction = json['transaction'] as String?;
+      if (transaction != null && _transactions.containsKey(transaction)) {
+        final completer = _transactions.remove(transaction)!;
+        completer.complete(json);
+        return;
+      }
+
+      _handleEvent(json);
+    } catch (e) {
+      JanusLogger.error('Error handling WebSocket message: $e');
+    }
+  }
+
+  void _handleEvent(Map<String, dynamic> json) {
+    final janus = json['janus'] as String?;
+
+    switch (janus) {
+      case 'keepalive':
+        JanusLogger.debug('Got keepalive');
+        break;
+      case 'ack':
+        JanusLogger.debug('Got ack');
+        break;
+      case 'event':
+        _handlePluginEvent(json);
+        break;
+      case 'webrtcup':
+        _handleWebRTCUp(json);
+        break;
+      case 'hangup':
+        _handleHangup(json);
+        break;
+      case 'detached':
+        _handleDetached(json);
+        break;
+      case 'media':
+        _handleMedia(json);
+        break;
+      case 'slowlink':
+        _handleSlowLink(json);
+        break;
+      case 'error':
+        JanusLogger.error('Server error: ${json['error']}');
+        break;
+      default:
+        JanusLogger.warn('Unknown event type: $janus');
+    }
+  }
+
+  void _handlePluginEvent(Map<String, dynamic> json) {
+    final sender = json['sender'] as int?;
+    if (sender == null) return;
+
+    final pluginHandle = _pluginHandles[sender];
+    if (pluginHandle == null) return;
+
+    final plugindata = json['plugindata'] as Map<String, dynamic>?;
+    final data = plugindata?['data'];
+    final jsep = json['jsep'] != null ? Jsep.fromMap(json['jsep']) : null;
+
+    pluginHandle.onmessage?.call(data, jsep);
+  }
+
+  void _handleWebRTCUp(Map<String, dynamic> json) {
+    final sender = json['sender'] as int?;
+    if (sender == null) return;
+
+    final pluginHandle = _pluginHandles[sender];
+    pluginHandle?.webrtcState?.call(true, null);
+  }
+
+  void _handleHangup(Map<String, dynamic> json) {
+    final sender = json['sender'] as int?;
+    if (sender == null) return;
+
+    final pluginHandle = _pluginHandles[sender];
+    final reason = json['reason'] as String?;
+    pluginHandle?.webrtcState?.call(false, reason);
+  }
+
+  void _handleDetached(Map<String, dynamic> json) {
+    final sender = json['sender'] as int?;
+    if (sender == null) return;
+
+    final pluginHandle = _pluginHandles[sender];
+    if (pluginHandle != null) {
+      pluginHandle.ondetached?.call();
+      _pluginHandles.remove(sender);
+    }
+  }
+
+  void _handleMedia(Map<String, dynamic> json) {
+    final sender = json['sender'] as int?;
+    if (sender == null) return;
+
+    final pluginHandle = _pluginHandles[sender];
+    final type = json['type'] as String?;
+    final receiving = json['receiving'] as bool?;
+    final mid = json['mid'] as String?;
+
+    if (type != null && receiving != null) {
+      pluginHandle?.mediaState?.call(type, receiving, mid);
+    }
+  }
+
+  void _handleSlowLink(Map<String, dynamic> json) {
+    final sender = json['sender'] as int?;
+    if (sender == null) return;
+
+    final pluginHandle = _pluginHandles[sender];
+    final uplink = json['uplink'] as bool?;
+    final lost = json['lost'] as int?;
+    final mid = json['mid'] as String?;
+
+    if (uplink != null && lost != null) {
+      pluginHandle?.slowLink?.call(uplink, lost, mid);
+    }
+  }
+
+  Future<Map<String, dynamic>> _sendMessage(Map<String, dynamic> message, String transaction) async {
+    if (_webSocket == null) {
+      throw Exception('WebSocket not connected');
+    }
+
+    final completer = Completer<Map<String, dynamic>>();
+    _transactions[transaction] = completer;
+
+    if (_sessionId != null) {
+      message['session_id'] = _sessionId;
+    }
+
+    final jsonString = jsonEncode(message);
+    JanusLogger.debug('Sending: $jsonString');
+    _webSocket!.add(jsonString);
+
+    return completer.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        _transactions.remove(transaction);
+        throw TimeoutException('Request timeout', const Duration(seconds: 10));
+      },
+    );
+  }
+
+  void _startKeepAlive() {
+    _keepAliveTimer = Timer.periodic(const Duration(seconds: 25), (timer) {
+      if (!_connected || _webSocket == null) {
+        timer.cancel();
+        return;
+      }
+
+      final request = {
+        'janus': 'keepalive',
+        'session_id': _sessionId,
+        'transaction': Janus.randomString(12),
+      };
+
+      if (token != null) request['token'] = token!;
+      if (apisecret != null) request['apisecret'] = apisecret!;
+
+      _webSocket!.add(jsonEncode(request));
+    });
+  }
+
+  void _cleanup() {
+    _keepAliveTimer?.cancel();
+    _webSocket?.close();
+    _connected = false;
+    _sessionId = null;
+    _transactions.clear();
+
+    if (_sessionId != null) {
+      Janus.sessions.remove(_sessionId);
+    }
   }
 }
 
 // --- Janus Plugin Handle ---
-
-/// Represents a handle to a specific plugin within a Janus session.
 class JanusPluginHandle {
   final JanusSession session;
   final String plugin;
   final int id;
-  bool detached = false;
-
-  // Callbacks
   final OnMessageCallback? onmessage;
-  final OnTrackCallback? onlocaltrack;
-  final OnRemoteTrackCallback? onremotetrack;
-  // ... other callbacks
+  final ConsentDialogCallback? consentDialog;
+  final IceStateCallback? iceState;
+  final MediaStateCallback? mediaState;
+  final WebRTCStateCallback? webrtcState;
+  final SlowLinkCallback? slowLink;
+  final OnCleanupCallback? oncleanup;
+  final OnDetachedCallback? ondetached;
+
+  bool _detached = false;
 
   JanusPluginHandle({
     required this.session,
     required this.plugin,
     required this.id,
     this.onmessage,
-    this.onlocaltrack,
-    this.onremotetrack,
-    // ... other callbacks
+    this.consentDialog,
+    this.iceState,
+    this.mediaState,
+    this.webrtcState,
+    this.slowLink,
+    this.oncleanup,
+    this.ondetached,
   });
 
   // --- Public API ---
-
   int getId() => id;
   String getPlugin() => plugin;
+  bool isDetached() => _detached;
 
-  /// Sends a message (with or without a JSEP) to the plugin.
-  Future<void> send({required Map<String, dynamic> message, Jsep? jsep, SuccessCallback<dynamic>? success, ErrorCallback? error}) async {}
-
-  /// Sends data over the Data Channel.
-  Future<void> data({required String text, String? label, SessionSuccessCallback? success, ErrorCallback? error}) async {}
-
-  /// Sends DTMF tones.
-  Future<void> dtmf({required Map<String, dynamic> dtmf, SessionSuccessCallback? success, ErrorCallback? error}) async {}
-
-  /// Creates a WebRTC offer.
-  Future<void> createOffer({
-    List<Map<String, dynamic>>? tracks,
-    bool? trickle,
-    bool? iceRestart,
-    SuccessCallback<Jsep>? success,
+  /// Send a message to the plugin
+  Future<void> send({
+    required Map<String, dynamic> message,
+    Jsep? jsep,
+    SuccessCallback<dynamic>? success,
     ErrorCallback? error,
-    SuccessCallback<Jsep>? customizeSdp,
-  }) async {}
+  }) async {
+    if (_detached) {
+      error?.call('Handle is detached');
+      return;
+    }
 
-  /// Creates a WebRTC answer.
-  Future<void> createAnswer({
-    required Jsep jsep,
-    List<Map<String, dynamic>>? tracks,
-    bool? trickle,
-    SuccessCallback<Jsep>? success,
+    try {
+      final transaction = Janus.randomString(12);
+      final request = {
+        'janus': 'message',
+        'body': message,
+        'transaction': transaction,
+        'session_id': session.getSessionId(),
+        'handle_id': id,
+      };
+
+      if (jsep != null) {
+        request['jsep'] = jsep.toMap();
+      }
+
+      if (session.token != null) request['token'] = session.token!;
+      if (session.apisecret != null) request['apisecret'] = session.apisecret!;
+
+      final response = await session._sendMessage(request, transaction);
+
+      if (response['janus'] == 'success') {
+        final plugindata = response['plugindata'];
+        final data = plugindata?['data'];
+        success?.call(data);
+      } else if (response['janus'] == 'ack') {
+        success?.call(null);
+      } else {
+        final errorInfo = JanusError.fromMap(response['error']);
+        error?.call(errorInfo);
+      }
+    } catch (e) {
+      error?.call(e);
+    }
+  }
+
+  /// Detach from the plugin
+  Future<void> detach({
+    SessionSuccessCallback? success,
     ErrorCallback? error,
-    SuccessCallback<Jsep>? customizeSdp,
-  }) async {}
+  }) async {
+    if (_detached) {
+      success?.call();
+      return;
+    }
 
-  /// Handles a remote JSEP (typically an offer from the plugin).
-  Future<void> handleRemoteJsep({required Jsep jsep, SessionSuccessCallback? success, ErrorCallback? error}) async {}
+    try {
+      final transaction = Janus.randomString(12);
+      final request = {
+        'janus': 'detach',
+        'transaction': transaction,
+        'session_id': session.getSessionId(),
+        'handle_id': id,
+      };
 
-  /// Replaces media tracks in an existing PeerConnection.
-  Future<void> replaceTracks({required List<Map<String, dynamic>> tracks, SessionSuccessCallback? success, ErrorCallback? error}) async {}
+      if (session.token != null) request['token'] = session.token!;
+      if (session.apisecret != null) request['apisecret'] = session.apisecret!;
 
-  /// Gets a list of local tracks.
-  List<Map<String, dynamic>> getLocalTracks() => [];
+      await session._sendMessage(request, transaction);
+      await _cleanup();
+      success?.call();
+    } catch (e) {
+      await _cleanup();
+      error?.call(e);
+    }
+  }
 
-  /// Gets a list of remote tracks.
-  List<Map<String, dynamic>> getRemoteTracks() => [];
-
-  /// Hangs up the PeerConnection.
-  Future<void> hangup({bool sendRequest = true}) async {}
-
-  /// Detaches from the plugin, releasing the handle on the gateway.
-  Future<void> detach({SessionSuccessCallback? success, ErrorCallback? error}) async {}
-
-  // --- Media utility methods ---
-
-  bool isAudioMuted({String? mid}) => throw UnimplementedError();
-  Future<bool> muteAudio({String? mid}) async => throw UnimplementedError();
-  Future<bool> unmuteAudio({String? mid}) async => throw UnimplementedError();
-
-  bool isVideoMuted({String? mid}) => throw UnimplementedError();
-  Future<bool> muteVideo({String? mid}) async => throw UnimplementedError();
-  Future<bool> unmuteVideo({String? mid}) async => throw UnimplementedError();
-
-  String getBitrate({String? mid}) => throw UnimplementedError();
-  void setMaxBitrate({required String mid, required int bitrate}) => throw UnimplementedError();
+  Future<void> _cleanup() async {
+    _detached = true;
+    session._pluginHandles.remove(id);
+    oncleanup?.call();
+  }
 }
