@@ -72,7 +72,7 @@ typedef OnDetachedCallback = void Function();
 typedef LocalCandidateCallback = void Function(RTCIceCandidate candidate);
 typedef ConnectionStateCallback = void Function(RTCPeerConnectionState state);
 typedef RemoteStreamCallback = void Function(MediaStream stream);
-typedef DataOpenCallback = void Function();
+typedef DataOpenCallback =  Function(RTCDataChannelState state);
 typedef DataCallback = void Function(RTCDataChannelMessage message);
 
 // --- Main Janus Class ---
@@ -721,7 +721,7 @@ class JanusPluginHandle {
     _dataChannel = await _peerConnection!.createDataChannel('oai-events', dcInit);
     _dataChannel!.onDataChannelState = (state) {
       if (state == RTCDataChannelState.RTCDataChannelOpen) {
-        ondataopen?.call();
+        ondataopen?.call(state);
       }
     };
     _dataChannel!.onMessage = (message) {
@@ -832,5 +832,13 @@ class JanusPluginHandle {
       candidate['sdpMLineIndex'] as int?,
     );
     _peerConnection!.addCandidate(rtcCandidate);
+  }
+  void sendData(String text) {
+    _dataChannel?.send(RTCDataChannelMessage(text));
+  }
+
+  /// 发送 session.update / session.create 等事件的便捷包装
+  void dataSdpEvents(Map<String, dynamic> payload) {
+    sendData(jsonEncode(payload));
   }
 }
