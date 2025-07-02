@@ -1,92 +1,99 @@
-
+import 'package:flutter/material.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:janus_flutter/janus.dart';
 
 void main() {
-  // 1. Initialize the Janus library
-  Janus.init(
-    debug: ["log", "error"],
-    callback: () {
-      // Initialization is complete, now we can create a session.
-      createJanusSession();
-    },
-  );
+  runApp(const JanusWebRtcExample());
 }
 
-void createJanusSession() {
-  late JanusSession janus;
-  late JanusPluginHandle videoRoomHandle;
+class JanusWebRtcExample extends StatefulWidget {
+  const JanusWebRtcExample({super.key});
 
-  // 2. Create a new Janus session
-  janus = JanusSession(
-    server: 'wss://your-janus-server.com/ws', // Replace with your Janus server URL
-    onSuccess: () {
-      print("Janus session created successfully!");
+  @override
+  State<JanusWebRtcExample> createState() => _JanusWebRtcExampleState();
+}
 
-      // 3. Attach to the VideoRoom plugin
-      janus.attach(
-        plugin: "janus.plugin.videoroom",
-        success: (handle) {
-          videoRoomHandle = handle;
-          print("Attached to VideoRoom plugin! Handle ID: ${videoRoomHandle.getId()}");
+class _JanusWebRtcExampleState extends State<JanusWebRtcExample> {
+  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
+  JanusSession? _session;
+  JanusPluginHandle? _handle;
 
-          // 4. Join a room
-          // This is a plugin-specific message.
-          final joinMessage = {
-            "request": "join",
-            "room": 1234, // Example room number
-            "ptype": "publisher",
-            "display": "Dart User"
-          };
+  @override
+  void initState() {
+    super.initState();
+    _initRenderers();
+    _initJanus();
+  }
 
-          videoRoomHandle.send(
-              message: joinMessage,
-              success: (data) {
-                print("Join request sent successfully.");
-              },
-              error: (error) {
-                print("Error sending join request: $error");
-              }
-          );
-        },
-        error: (error) {
-          print("Failed to attach to VideoRoom plugin: $error");
-        },
-        onmessage: (msg, jsep) {
-          // 5. Handle asynchronous events from the plugin
-          print("Got a message from the plugin:");
-          print(msg);
+  Future<void> _initRenderers() async {
+    await _localRenderer.initialize();
+    await _remoteRenderer.initialize();
+  }
 
-          final event = msg['videoroom'];
-          if (event == 'joined') {
-            print("Successfully joined room ${msg['room']}!");
-            // At this point, you would typically create an offer to start publishing.
-            // videoRoomHandle.createOffer(...);
-          } else if (event == 'event') {
-            // Handle other events, like new publishers joining the room.
-            if (msg['publishers'] != null) {
-              print("New publishers in the room: ${msg['publishers']}");
-              // For each publisher, you would create a new subscriber handle
-              // and send a "join" request with ptype: "subscriber".
-            }
-          }
+  Future<void> _initJanus() async {
+    await Janus.init(debug: ['log', 'error']);
+    _session = JanusSession(
+      server: 'wss://your-janus-server/ws',
+      onSuccess: _attach,
+      onError: (e) => debugPrint('Session error: $e'),
+    );
+  }
 
-          if (jsep != null) {
-            print("Got a JSEP offer/answer:");
-            print(jsep.toMap());
-            // Handle the JSEP, e.g., by creating an answer.
-            // videoRoomHandle.createAnswer(jsep: jsep, ...);
-          }
-        },
-        oncleanup: () {
-          print("Plugin handle cleaned up.");
-        },
-      );
-    },
-    onError: (error) {
-      print("Failed to create Janus session: $error");
-    },
-    onDestroyed: () {
-      print("Janus session destroyed.");
-    },
-  );
+  Future<void> _attach() async {
+    await _session!.attach(
+      plugin: 'janus.plugin.echotest',
+      success: (handle) async {
+        _handle = handle;
+        await _startWebRtc();
+      },
+      onmessage: (msg, jsep) async {
+        if (jsep != null && _handle != null) {
+          await _handle!.handleRemoteJsep(jsep);
+        }
+      },
+      oncleanup: () => debugPrint('Handle cleaned up'),
+    );
+  }
+
+  Future<void> _startWebRtc() async {
+    final localStream = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': true});
+    _localRenderer.srcObject = localStream;
+
+    await _handle!.initPeerConnection(
+      configuration: {'iceServers': []},
+      stream: localStream,
+      onRemoteStream: (stream) {
+        setState(() {
+          _remoteRenderer.srcObject = stream;
+        });
+      },
+    );
+
+    final offer = await _handle!.createOffer();
+    await _handle!.send(message: {'audio': true, 'video': true}, jsep: offer);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      home: Scaffold(
+        appBar: AppBar(title: const Text('Janus WebRTC Example')),
+        body: Column(
+          children: [
+            Expanded(child: RTCVideoView(_localRenderer)),
+            Expanded(child: RTCVideoView(_remoteRenderer)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _localRenderer.dispose();
+    _remoteRenderer.dispose();
+    _session?.destroy();
+    super.dispose();
+  }
 }
