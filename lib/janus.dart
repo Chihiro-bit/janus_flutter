@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'log/janus_log.dart';
 
 
@@ -68,6 +69,9 @@ typedef WebRTCStateCallback = void Function(bool on, String? reason);
 typedef SlowLinkCallback = void Function(bool uplink, int lost, String? mid);
 typedef OnCleanupCallback = void Function();
 typedef OnDetachedCallback = void Function();
+typedef LocalCandidateCallback = void Function(RTCIceCandidate candidate);
+typedef ConnectionStateCallback = void Function(RTCPeerConnectionState state);
+typedef RemoteStreamCallback = void Function(MediaStream stream);
 
 // --- Main Janus Class ---
 class Janus {
@@ -415,6 +419,9 @@ class JanusSession {
       case 'slowlink':
         _handleSlowLink(json);
         break;
+      case 'trickle':
+        _handleTrickle(json);
+        break;
       case 'error':
         JanusLogger.error('Server error: ${json['error']}');
         break;
@@ -493,6 +500,17 @@ class JanusSession {
     }
   }
 
+  void _handleTrickle(Map<String, dynamic> json) {
+    final sender = json['sender'] as int?;
+    if (sender == null) return;
+
+    final pluginHandle = _pluginHandles[sender];
+    final candidate = json['candidate'] as Map<String, dynamic>?;
+    if (pluginHandle != null && candidate != null) {
+      pluginHandle._handleRemoteCandidate(candidate);
+    }
+  }
+
   Future<Map<String, dynamic>> _sendMessage(Map<String, dynamic> message, String transaction) async {
     if (_webSocket == null) {
       throw Exception('WebSocket not connected');
@@ -566,6 +584,10 @@ class JanusPluginHandle {
   final OnDetachedCallback? ondetached;
 
   bool _detached = false;
+  RTCPeerConnection? _peerConnection;
+  LocalCandidateCallback? onLocalCandidate;
+  ConnectionStateCallback? onConnectionState;
+  RemoteStreamCallback? onRemoteStream;
 
   JanusPluginHandle({
     required this.session,
@@ -579,6 +601,9 @@ class JanusPluginHandle {
     this.slowLink,
     this.oncleanup,
     this.ondetached,
+    this.onLocalCandidate,
+    this.onConnectionState,
+    this.onRemoteStream,
   });
 
   // --- Public API ---
@@ -667,5 +692,123 @@ class JanusPluginHandle {
     _detached = true;
     session._pluginHandles.remove(id);
     oncleanup?.call();
+  }
+
+  Future<void> createPeerConnection({
+    Map<String, dynamic> configuration = const {},
+    Map<String, dynamic> offerSdpConstraints = const {
+      'mandatory': {
+        'OfferToReceiveAudio': true,
+        'OfferToReceiveVideo': true,
+      },
+      'optional': [],
+    },
+    List<MediaStream> mediaStreams = const [],
+  }) async {
+    _peerConnection =
+        await createPeerConnection(configuration, offerSdpConstraints);
+
+    for (final stream in mediaStreams) {
+      for (final track in stream.getTracks()) {
+        await _peerConnection!.addTrack(track, stream);
+      }
+    }
+
+    _peerConnection!.onIceCandidate = (candidate) {
+      if (candidate.candidate != null && candidate.candidate!.isNotEmpty) {
+        _trickleCandidate(candidate);
+        onLocalCandidate?.call(candidate);
+      } else {
+        _trickleCandidate(null);
+      }
+    };
+
+    _peerConnection!.onConnectionState = (state) {
+      onConnectionState?.call(state);
+    };
+
+    _peerConnection!.onTrack = (event) {
+      if (event.streams.isNotEmpty) {
+        onRemoteStream?.call(event.streams.first);
+      }
+    };
+  }
+
+  Future<Jsep> createOffer(
+      {Map<String, dynamic> constraints = const {}}) async {
+    if (_peerConnection == null) {
+      throw Exception('PeerConnection not initialized');
+    }
+    final offer = await _peerConnection!.createOffer(constraints);
+    await _peerConnection!.setLocalDescription(offer);
+    return Jsep(type: offer.type, sdp: offer.sdp);
+  }
+
+  Future<Jsep> createAnswer(
+      {Map<String, dynamic> constraints = const {}}) async {
+    if (_peerConnection == null) {
+      throw Exception('PeerConnection not initialized');
+    }
+    final answer = await _peerConnection!.createAnswer(constraints);
+    await _peerConnection!.setLocalDescription(answer);
+    return Jsep(type: answer.type, sdp: answer.sdp);
+  }
+
+  Future<void> handleRemoteJsep(Jsep jsep) async {
+    if (_peerConnection == null) {
+      return;
+    }
+    final remote = RTCSessionDescription(jsep.sdp, jsep.type);
+    await _peerConnection!.setRemoteDescription(remote);
+  }
+
+  Future<void> addCandidate(RTCIceCandidate candidate) async {
+    await _peerConnection?.addCandidate(candidate);
+  }
+
+  Future<void> closePeerConnection() async {
+    await _peerConnection?.close();
+    _peerConnection = null;
+  }
+
+  Future<void> _trickleCandidate(RTCIceCandidate? candidate) async {
+    final transaction = Janus.randomString(12);
+    final request = {
+      'janus': 'trickle',
+      'transaction': transaction,
+      'session_id': session.getSessionId(),
+      'handle_id': id,
+      'candidate': candidate != null
+          ? {
+              'candidate': candidate.candidate,
+              'sdpMid': candidate.sdpMid,
+              'sdpMLineIndex': candidate.sdpMLineIndex,
+            }
+          : {
+              'completed': true,
+            },
+    };
+
+    if (session.token != null) request['token'] = session.token!;
+    if (session.apisecret != null) request['apisecret'] = session.apisecret!;
+
+    try {
+      await session._sendMessage(request, transaction);
+    } catch (e) {
+      JanusLogger.error('Failed to send trickle: $e');
+    }
+  }
+
+  void _handleRemoteCandidate(Map<String, dynamic> candidate) {
+    if (_peerConnection == null) return;
+    if (candidate['completed'] == true) {
+      return;
+    }
+    final rtcCandidate = RTCIceCandidate(
+      candidate['candidate'] as String?,
+      candidate['sdpMid'] as String?,
+      candidate['sdpMLineIndex'] as int?,
+    );
+    _peerConnection!.addCandidate(rtcCandidate);
   }
 }
