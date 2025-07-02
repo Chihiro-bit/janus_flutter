@@ -28,7 +28,7 @@ void createJanusSession() {
             'video': true,
           });
 
-          await echoHandle.createPeerConnection(
+          await echoHandle.initPeerConnection(
             mediaStreams: [localStream!],
             onLocalCandidate: (c) => print('Local candidate: ${c.candidate}'),
             onConnectionState: (state) => print('Connection state: $state'),
